@@ -1,0 +1,926 @@
+/*
+ * This is the c[]re class of the Shake app.
+ *  From here we create a Detector to listen for shakes, and
+ *  a Query to make matches.
+ * ShakeApp is a java implementation of a handshake recognition system utilizing a Dynamic Time Warping (DTW) algorithm.
+ * Intended to be the android side of a Pebble/Android companion system.
+ * Pebble provides the accelerometer data which Detector processes.
+ * This is not only a system for detection of a gesture, but also for communication between pebble and android.
+*/
+package com.williams_research.pebble_shake;
+
+import android.content.BroadcastReceiver;
+import android.content.ContentProviderOperation;
+import android.content.ContentProviderResult;
+import android.content.Context;
+import android.content.Intent;
+import android.os.Handler;
+import android.provider.ContactsContract;
+import android.support.annotation.NonNull;
+import android.support.v7.app.AppCompatActivity;
+import android.os.Bundle;
+import android.util.Log;
+import android.view.Menu;
+import android.view.MenuItem;
+import android.widget.Button;
+import android.widget.EditText;
+import android.view.View;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.util.ArrayList;
+import java.util.Arrays;
+
+import com.getpebble.android.kit.Constants;
+import com.getpebble.android.kit.PebbleKit;
+import com.getpebble.android.kit.util.PebbleDictionary;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.FileOutputStream;
+import java.math.BigDecimal;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+
+// main class
+public class ShakeApp extends AppCompatActivity {
+
+    /******
+     *
+     * IDs **/
+    // Application context
+    // !do not initialize until end of onCreate()!
+    Context context;
+
+    // The ID (called UUID) of the shake app on pebble
+    private final static UUID SHAKE_UUID = UUID.fromString("4ed2044c-4f7b-4a0c-a8a4-3006df39d119");
+    private final static String SIG_FILENAME = "signature_series.txt";
+    private int USER_ID = 0;
+
+    /******
+     *
+     * KEYS **/
+    // [P-->W] Dictionary
+    private static final int X_KEY = 0;
+    private static final int Y_KEY = 1;
+    private static final int Z_KEY = 2;
+    private static final int T_KEY = 3;
+    private static final int TYPE_KEY = 4;
+    private static final int GO = 1;
+    private static final int ON_PRESS = 2;
+    private static final int STOP = 0;
+
+    // [P-->DB] Table Index Labels
+    private static final int con_NAME_KEY = 0;
+    private static final int con_NUMBER_KEY = 1;
+
+    /******
+     *
+     * APP PHASES **/
+    private static final int MODE = ON_PRESS;
+            ;
+    // determines whether we will consider data for training
+    private boolean TRAINING = true;
+
+    /******
+     *
+     * DTW ALGORITHM **/
+    // maximum distance away from signature of a matching series
+    private final static int DTW_THRESHOLD = 10000000;
+    private final static int DIMENSION = 3;
+
+    /******
+     *
+     * STATUS OF DATA STRUCTURES **/
+    // whether a signature has been logged
+    private boolean ACTIVE_SIGNATURE = false;
+    private boolean appIsOpen = false;
+    // params for lengths of collections
+    private int SESSION_WINDOW = 10;
+    private int SIGNATURE_WINDOW = 10;
+    // current sample count
+    private int current_index = 0;
+    // current session count on current signature
+    private int session_index = 0;
+
+    /******
+     *
+     * DATA STRUCTURES **/
+    // a session (time-series instance of the handshake detection problem)
+    private int[][] session_acceldata = new int[SESSION_WINDOW][3];
+
+    // a signature (the model time-series of a handshake)
+    private int[][] signature_acceldata = new int[SIGNATURE_WINDOW][3];
+    private int[] timestamps = new int[SESSION_WINDOW];
+
+    private PseudoServer pseudo = new PseudoServer();
+
+     /***********\
+     **
+     ** [ SHAKEAPP METHODS ]
+     **
+     \***********/
+
+     /*******************************************************\
+     *
+     * Turn a string array of information into a Contact
+     *
+     \*/
+     protected void makeContact( String[] contact_info ){
+
+         //Operations for Content Provider to perform
+         ArrayList<ContentProviderOperation> ops = new ArrayList<ContentProviderOperation>();
+
+         int rawContactInsertIndex = ops.size();
+
+         //First Operation: Insert account type and account name to RawContacts
+         ops.add(ContentProviderOperation.newInsert(ContactsContract.RawContacts.CONTENT_URI)
+                 .withValue(ContactsContract.RawContacts.ACCOUNT_TYPE, null)
+                 .withValue(ContactsContract.RawContacts.ACCOUNT_NAME,null )
+                 .build());
+
+         //Second Operation: Add Number to Data with reference to RAW_CONTACT_ID
+         ops.add(ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                 .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, rawContactInsertIndex)
+                 .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE)
+                 .withValue(ContactsContract.CommonDataKinds.Phone.NUMBER, contact_info[con_NUMBER_KEY])
+                 .build());
+
+         //Third Operation: Add Name to Data with reerence to RAW_CONTACT_ID
+         ops.add(ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                 .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, rawContactInsertIndex)
+                 .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE)
+                 .withValue(ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME, contact_info[con_NAME_KEY])
+                 .build());
+
+        //Add the contact
+         try {
+
+            ContentProviderResult[] res = getContentResolver().applyBatch(ContactsContract.AUTHORITY, ops);
+
+         }catch(Exception e){
+
+            Log.i(getLocalClassName(), "ALERT: Contact Adding Operation Exception");
+
+         }
+     }
+
+
+    /*******************************************************\
+     *
+     * Implementation of Dynamic Time Warping to find distance between the signature's series
+     * and the current session's series
+     *
+     \*/
+    protected boolean isMatch_DTW(int[][] session){
+
+        //Create and populate a sample of the session.
+        // sample is of size equal to desired SESSION_WINDOW,
+        // whereas session can be longer(in theory/not currently in practice) l
+        int[][] sample = new int[SESSION_WINDOW][3];
+        for(int i = 0; i < SESSION_WINDOW; i++) {
+            sample[i][X_KEY] = session[i][X_KEY];
+            sample[i][Y_KEY] = session[i][Y_KEY];
+            sample[i][Z_KEY] = session[i][Z_KEY];
+        }
+
+        Log.i(getLocalClassName(), session_index + "isMatch() : MADE SAMPLE " + Arrays.deepToString(sample));
+        Log.i(getLocalClassName(), session_index + "isMatch() : HAVE SIGNATURE " + Arrays.deepToString(signature_acceldata));
+
+        //Create and populate the DTW's grid
+        int[] grid = new int[SESSION_WINDOW*SIGNATURE_WINDOW];
+        // (seems to be a linearization of the 2X2 grid seen on Wikipedia
+        for(int i=0;i<SESSION_WINDOW*SIGNATURE_WINDOW;i++) {
+            grid[i] = -1;
+        }
+
+        //Compute distance between sample and signature
+        int distance = distanceDTW(sample,signature_acceldata, SESSION_WINDOW-1, SIGNATURE_WINDOW-1,SESSION_WINDOW, SIGNATURE_WINDOW, grid);
+        Toast.makeText(context, "Distance: " + distance, Toast.LENGTH_SHORT).show();
+        Log.i(getLocalClassName(), "isMatch() : RECORDED DISTANCE OF " + distance);
+
+        // increment session_index
+        session_index++;
+
+        //Determine if a handshake has occured
+        if((distance/SESSION_WINDOW*2) < DTW_THRESHOLD ){
+            // match
+            return true;
+
+        }else {
+
+            // no match
+            return false;
+
+        }
+
+
+    }
+
+    /*******************************************************\
+     *
+     * Function to compute the "distance" between two discrete time signals
+     * [Determining Algorithm: Dynamic Time Warping]
+     *
+     */
+    protected int distanceDTW(int[][] session , int[][] signature, int i, int j, int length1, int length2, int[] table){
+        int k = 0;
+
+        // check that we have data
+        if( i < 0 || j < 0){
+            return 100000000;
+        }else{
+            // DTW vars:
+            int tableWidth = length2;
+            int localDistance = 0;
+
+            //
+            for(k=0; k<DIMENSION; k++) {
+                localDistance += ((session[i][k]-signature[j][k])*(session[i][k]-signature[j][k]));
+            }
+
+            int sdistance, s1, s2, s3;
+            if( i == 0 && j == 0) {
+
+                if( table[i*tableWidth+j] < 0) table[i*tableWidth+j] = localDistance;
+                return localDistance;
+
+            } else if( i==0 ) {
+
+                if( table[i*tableWidth+(j-1)] < 0){
+                    sdistance = distanceDTW(session, signature, i, j - 1, length1,length2,table);
+                }
+                else {
+                    sdistance = table[i * tableWidth + j - 1];
+                }
+
+            } else if( j==0 ) {
+                if( table[(i-1)*tableWidth+ j] < 0) {
+                    sdistance = distanceDTW(session, signature, i - 1, j, length1, length2, table);
+                } else {
+                    sdistance = table[(i - 1) * tableWidth + j];
+                }
+            } else {
+                if (table[i * tableWidth + (j - 1)] < 0) {
+                    s1 = distanceDTW(session, signature, i, j - 1, length1, length2, table);
+                } else {
+                    s1 = table[i * tableWidth + (j - 1)];
+                }
+                if (table[(i - 1) * tableWidth + j] < 0) {
+                    s2 = distanceDTW(session, signature, i - 1, j, length1, length2, table);
+                } else {
+                    s2 = table[(i - 1) * tableWidth + j];
+                }
+                if (table[(i - 1) * tableWidth + j - 1] < 0) {
+                    s3 = distanceDTW(session, signature, i - 1, j - 1, length1, length2, table);
+                } else {
+                    s3 = table[(i - 1) * tableWidth + j - 1];
+                }
+
+                if (s1 < s2){
+                    sdistance = s1;
+                }else{
+                    sdistance = s2;
+                }
+
+                if(sdistance>=s3){
+                    sdistance = s3;
+                }
+
+            }
+            table[i*tableWidth+j] = localDistance + sdistance;
+            return table[i*tableWidth+j];
+        }
+
+    }
+
+    /*******************************************************\
+     *
+     * Function to update the detection model
+     *
+     */
+    protected void logSessionData(int X, int Y, int Z, int T) {
+        // only store data if within window bounds (current policy)
+        if( current_index < SESSION_WINDOW ) {
+
+            // add to current session data
+            session_acceldata[current_index][X_KEY] = X;
+            session_acceldata[current_index][Y_KEY] = Y;
+            session_acceldata[current_index][Z_KEY] = Z;
+            timestamps[current_index] = T;
+
+            // log activity
+            Log.i(getLocalClassName(), "Received value=" + (current_index) + " for session" + (session_index));
+            Log.i(getLocalClassName(), "Received value=" + X + " for key: X");
+            Log.i(getLocalClassName(), "Received value=" + Y + " for key: Y");
+            Log.i(getLocalClassName(), "Received value=" + Z + " for key: Z");
+            Log.i(getLocalClassName(), "Received value=" + T + " for key: T");
+
+            // increment data counter
+            current_index++;
+
+        }else{
+            Log.i(getLocalClassName(), "call to logSessionData when current_index >= SESSION_WINDOW");
+        }
+
+
+
+    }
+    /*******************************************************\
+     *
+     * Function to determine if a match has occured by running DTW, or obtain a signature
+     *
+     */
+    protected void processSession() {
+        //log entrance stats
+        Log.i(getLocalClassName(), "process() : ENTERING @ (" + current_index + " , " + ACTIVE_SIGNATURE + ")");
+        Log.i(getLocalClassName(), "process() : WITH SIGNATURE OF :" + Arrays.deepToString(signature_acceldata));
+        Log.i(getLocalClassName(), "process() : training = " + TRAINING);
+        //log times ?timestamp format unknown? given for a sample in timestamps
+
+        /*TRAINING ROUTINE*/
+        if( TRAINING ) {
+            // one possibility is to remember all signatures in a vector(int[])
+            // index 0 will contain the ID of the session
+            // index 1 will contain whether the session is unique or is following a signature
+            // index 2-n will contain the session_data
+
+        }
+
+        if (ACTIVE_SIGNATURE) {
+        //Data is not a potential signature -
+            // run DTW on data collected and report result
+            if (isMatch_DTW(session_acceldata)) {
+
+                // alert : positive
+                Toast.makeText(context, "SHAKE DETECTED", Toast.LENGTH_SHORT).show();
+                Log.i(getLocalClassName(), "process() : SESSION " + Arrays.deepToString(session_acceldata));
+                Log.i(getLocalClassName(), "process() : POSITIVE AGAINST" + Arrays.deepToString(signature_acceldata));
+
+                //Query the database to find gesture_partner
+                // build query
+                //Query query = new Query(session_acceldata,signature_acceldata);
+                // makeMatch( );
+
+
+            } else {
+                // alert: negative
+                Toast.makeText(context, "NO SHAKE DETECTED", Toast.LENGTH_SHORT).show();
+                Log.i(getLocalClassName(), "process() : SESSION " + Arrays.deepToString(session_acceldata));
+                Log.i(getLocalClassName(), "process() : NEGATIVE AGAINST" + Arrays.deepToString(signature_acceldata));
+            }
+
+        } else {
+            //No active signature series exists-
+            // set signature to be the session which just occurred
+            setSignature(session_acceldata);
+
+            // alert: created signature
+            Toast.makeText(context, "process() : SIGNATURE LOADED", Toast.LENGTH_SHORT).show();
+        }
+
+        // reset data collection index
+        current_index = 0;
+    }
+
+    /*******************************************************\
+     *
+     * Function to establish a signature series
+     *
+     */
+    protected void setSignature(int[][] sig){
+        Log.i(getLocalClassName(), "setSignature() : ENTERING with SIG = " + Arrays.deepToString(signature_acceldata));
+
+        // we are activating a signature
+        ACTIVE_SIGNATURE = true;
+
+        // signature data file (check for existence)
+        File file = new File(context.getFilesDir(), SIG_FILENAME);
+        boolean exists = file.exists();
+        Log.i(getLocalClassName(), "setSig() EXISTS = "+ exists);
+
+        // If file doesnt exist, create it
+        if ( !exists ) {
+            try {
+
+                // write the acceleration data signature to the file
+                FileOutputStream fos = openFileOutput(SIG_FILENAME, MODE_PRIVATE);
+                ObjectOutputStream oos = new ObjectOutputStream(fos);
+                oos.writeObject(sig);
+                oos.close();
+
+                // alert: stored signature
+                Toast.makeText(context, "setSig() : Stored Signature", Toast.LENGTH_SHORT).show();
+                Log.i(getLocalClassName(), "setSig() : FILE DNE ");
+
+            }catch(Exception ex) {
+                ex.printStackTrace();
+            }
+
+        // NOW FILE EXISTS
+        }
+
+        try {
+                // load the existing signature from file
+                ObjectInputStream ois = new ObjectInputStream(openFileInput(SIG_FILENAME));
+                signature_acceldata = (int[][]) ois.readObject();
+
+                // alert: loaded signature
+                Toast.makeText(context, "Loaded Signature", Toast.LENGTH_SHORT).show();
+                Log.i(getLocalClassName(), "setSig() : FILE EXISTS ");
+                Log.i(getLocalClassName(), "setSig() : LOADED EXISTING SIG = " + Arrays.deepToString(signature_acceldata));
+
+        } catch (Exception exc) {
+                exc.printStackTrace();
+        }
+
+    }
+
+
+    /*******************************************************\
+     *
+     * Function called to attempt a pairing via Query Q
+     * @param e : the event to be processed
+     */
+    protected void processEvent( Event e ){
+
+        // form a query from event_data
+        Query Q = new Query(e, pseudo);
+
+        // post the query to data_table
+        try {
+
+            Q.post();
+
+        }catch(Exception process_ex_0){
+
+            process_ex_0.printStackTrace();
+        }
+
+        // update match table entry with PseudoServer
+        PseudoServer ps = new PseudoServer();
+        ps.pair(USER_ID, e.getTime());
+
+        // determine a matching user
+        boolean isMatched = Q.hasMatch();
+
+        // make the contact if matching user exists
+        if( isMatched ){
+
+            makeContact(Q.getContactInfo());
+
+        }else{
+
+            Log.i(getLocalClassName(),"makeMatch() : no partner exists for this gesture");
+
+        }
+
+    }
+
+
+    /***********\
+     **
+     ** [ OVERIDE METHODS ]
+     **
+    \***********/
+
+
+    /*******************************************************\
+     *
+     * Function to set "Handlers"
+     *
+     */
+    protected void setHandlers() {
+
+        //Connection Handlers -
+        // register a receiver for the connected pebble
+        PebbleKit.registerPebbleConnectedReceiver(getApplicationContext(), new BroadcastReceiver() {
+
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                Log.i(getLocalClassName(), "Pebble connected!");
+            }
+
+        });
+
+        // register a dis-connected receiver for the connected pebble
+        PebbleKit.registerPebbleDisconnectedReceiver(getApplicationContext(), new BroadcastReceiver() {
+
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                Log.i(getLocalClassName(), "Pebble disconnected!");
+            }
+
+        });
+
+        //Message ACK/NACK Handlers -
+        // outgoing:
+        // successful transmission
+        PebbleKit.registerReceivedAckHandler(getApplicationContext(), new PebbleKit.PebbleAckReceiver(SHAKE_UUID) {
+
+            @Override
+            public void receiveAck(Context context, int transactionId) {
+                Log.i(getLocalClassName(), "Received ack for transaction " + transactionId);
+            }
+        });
+
+        // unsuccessful transmission
+        PebbleKit.registerReceivedNackHandler(getApplicationContext(), new PebbleKit.PebbleNackReceiver(SHAKE_UUID) {
+
+            @Override
+            public void receiveNack(Context context, int transactionId) {
+                Log.i(getLocalClassName(), "Received nack for transaction " + transactionId);
+            }
+
+        });
+
+        //Message RECEPTION Handlers -
+        // incoming:
+        PebbleKit.registerReceivedDataHandler(this, new PebbleKit.PebbleDataReceiver(SHAKE_UUID ) {
+
+            @Override
+            //Define function called when data is received from watch-
+            public void receiveData(final Context context, final int transactionId, final PebbleDictionary data) {
+                if( MODE == GO) {
+                    // data for three axes and time
+                    int trace_X, trace_Y, trace_Z, trace_T;
+
+                    // collect the xyz accelerometer data for the model
+                    trace_X = new BigDecimal(data.getInteger(X_KEY)).intValueExact();
+                    trace_Y = new BigDecimal(data.getInteger(Y_KEY)).intValueExact();
+                    trace_Z = new BigDecimal(data.getInteger(Z_KEY)).intValueExact();
+                    trace_T = new BigDecimal(data.getInteger(T_KEY)).intValueExact();
+
+                    // record data if within session window
+                    if (current_index < SESSION_WINDOW) {
+
+                        logSessionData(trace_X, trace_Y, trace_Z, trace_T);
+
+                    } else {
+
+                        // send STOP
+                        PebbleDictionary end_packet = new PebbleDictionary();
+                        end_packet.addInt32(TYPE_KEY, STOP);
+                        PebbleKit.sendDataToPebble(getApplicationContext(), SHAKE_UUID, end_packet);
+
+                        // process the session
+                        Toast.makeText(context, "processing your shake session...", Toast.LENGTH_SHORT).show();
+                        Log.i(getLocalClassName(), "Process triggered by: current_index = " + current_index);
+                        processSession();
+
+                    }
+                }else if(MODE == ON_PRESS){
+
+                    // Immediately attempt a match
+                    // [possibly merge with process session]
+                    int trace_T = new BigDecimal(data.getInteger(T_KEY)).intValueExact();
+                    // [trace_T will eventually be a component of an EVENT class]
+                    // int[] event_dat = new int[]{trace_T};
+                    // Event press_event = new Event(event_dat);
+                    // processEvent(press_event);
+		    int event_id = postEvent( trace_T );
+		    boolean hasMatch = pair(event_id);
+
+                }
+                // acknowledge message was received
+                PebbleKit.sendAckToPebble(getApplicationContext(), transactionId);
+            }
+
+        });
+	
+
+    }
+
+    private int postEvent( int t ){
+
+	// create event as associative list 
+	ArrayList<NameValuePair> event = new ArrayList<NameValuePair>();
+	event.add( new BasicNameValuePair("time", t));
+
+	// post event 
+	try{
+	    
+	    // prep connection 
+	    URL events_url = new URL( urlstring_EVENTS );
+	    HttpURLConnection conn = (HttpURLConnection) events_url.openConnection();
+	    conn.setRequestMethod("POST"); 
+	    conn.setDoOutput(true); 
+	    
+	    // output the event 
+	    OutputStream outStream = conn.getOutputStream();
+	    BufferedWriter outWriter = new BufferedWriter( new OutputStreamWriter(outStream, "UTF-8"));
+	    outWriter.write( encodeList(userProfile) );
+	    outWriter.flush();
+	    outWriter.close();
+	    outStream.close();
+
+	    // get response code from server
+	    int responseCode = conn.getResponseCode();
+	    
+	    // check 
+	    if( responseCode != 202 ){
+
+		Log.i("postEvent : ", "NON 202 RESPONSE CODE -> " + responseCode );
+		return -1;
+
+	    }else{
+		
+		// read server response (as JSON format string)
+		BufferedReader inReader = new BufferedReader( new InputStreamReader( conn.getInputStream()));
+		String inLine;
+		StringBuffer response = new StringBuffer();
+
+		while((inputLine= inReader.readLine()) != null) {
+		    response.append(inLine);
+		}
+
+		inReader.close();
+
+		//
+		// Get contact information arrays from JSONarray 
+		// 
+		JSONArray jArray = new JSONArray(response);
+		for(int i=0; i<jArray.length();i++){
+	
+		    JSONObject json_data = jArray.getJSONObect(i);
+		    //get last name
+		    //get first name
+		    //get phone number 
+		    
+		
+		}
+	    }
+
+	}catch( Exception e){
+	    
+	}
+	
+	
+    }
+    
+    // 
+    // Pair: request a matching from the server until a timeout or a success
+    // 
+    private boolean pair(int event_id){
+
+	// 
+	boolean paired = false;
+	
+	// 
+	while( !paired ){
+	    
+            // create user profile to be added
+            ArrayList<NameValuePair> pairingRequest = new ArrayList<NameValuePair>();
+            pairingRequest.add( new BasicNameValuePair("event_id",event_id));
+
+            // http posting
+            try{
+
+                // prep connection
+                URL pair_url = new URL(urlstr_PAIR);
+                HttpURLConnection conn = (HttpURLConnection) pair_url.openConnection();
+                conn.setRequestMethod("GET");
+                conn.setDoOutput(true);
+
+                // send the event data
+                OutputStream outStream = conn.getOutputStream();
+                BufferedWriter outWriter = new BufferedWriter( new OutputStreamWriter(outStre\
+										      am, "UTF-8"));
+                outWriter.write( encodeList(userProfile) );
+                outWriter.flush();
+                outWriter.close();
+                outStream.close();
+
+		// check response 
+                int responseCode = con.getResponseCode();
+		
+		// check error
+		if( responseCode != 202){
+		    Log.i("postEvent :", "non 202 HTTP response code --> " + responseCode);
+		}else{
+
+                // read response
+                BufferedReader inReader = new BufferedReader( new InputStreamReader( con.getInputStream()));
+
+                String inLine;
+                StringBuffer response = new StringBuffer();
+
+                while((inputLine= inReader.readLine()) != null) {
+                    response.append(inLine);
+                }
+
+                inReader.close();
+
+            }catch( Exception ex ){
+                Log.e("dbc_postevent: ", "Error in http connection " +ex.toString());
+            }
+
+	    // parse JSON
+            try{
+                JSONArray jArray = new JSONArray(response);
+                for(int i=0; i<jArray.length();i++){
+                    JSONObject json_data = jArray.getJSONObect(i);
+                    //                  Log.i("dbc_postevent" , "id: "+json_data.getInt("id")
+                }
+
+            }catch( Exception ex ){
+                Log.e("dbc_postevent" , "Error parsing JSON"+ex.toString());
+            }
+	    }
+
+	}
+    }
+
+    /*******************************************************\
+     *
+     * Function called when app resumes activity
+     *
+     */
+    @Override
+    protected void onResume() {
+        super.onResume();
+        Log.i(getLocalClassName(),"call to onResume");
+    }
+
+    /*******************************************************\
+     *
+     * Function called when app is first created. 1st method called.
+     *
+     */
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_detector);
+
+        // Define the onscreen buttons to listen to-
+        final Button launchtestButton = (Button) findViewById(R.id.launchtest_button);
+        final Button closeButton = (Button) findViewById(R.id.close_button);
+        final Button eraseButton = (Button) findViewById(R.id.erase_button);
+
+        // Listen for launch session-
+        launchtestButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+
+                // get app context
+                Context context = getApplicationContext();
+
+                // check if a watch is connected
+                boolean isConnected = PebbleKit.isWatchConnected(context);
+
+                // act if connected to a watch
+                if (isConnected) {
+                    // launch app if not open
+                    if(!appIsOpen) {
+
+                        // alert: launching app
+                        Toast.makeText(context, "launching the shake application...", Toast.LENGTH_SHORT).show();
+
+                        // launch shake app to begin a session
+                        PebbleKit.startAppOnPebble(context, SHAKE_UUID);
+                        appIsOpen = true;
+
+                    }
+
+                    // alert: launching a session
+                    Toast.makeText(context, "launching your shake session...", Toast.LENGTH_SHORT).show();
+
+                    // signal for watch to begin transmitting data
+                    PebbleDictionary data = new PebbleDictionary();
+                    data.addInt32(TYPE_KEY, MODE );
+                    PebbleKit.sendDataToPebble(getApplicationContext(), SHAKE_UUID, data);
+
+
+                } else {
+                    // alert: no connection
+                    Toast.makeText(context, "not_connected", Toast.LENGTH_LONG).show();
+                }
+            }
+        });
+
+        // listen for close session
+        closeButton.setOnClickListener(new View.OnClickListener(){
+            @Override
+            public void onClick(View view){
+
+                // close Pebble shake if a watch is connected
+                if(PebbleKit.isWatchConnected(getApplicationContext())) {
+                    // close the application
+                    PebbleKit.closeAppOnPebble(getApplicationContext(), SHAKE_UUID);
+                    // alert: closed app
+                    Toast.makeText(context, " closed Pebble shake ", Toast.LENGTH_LONG).show();
+                    appIsOpen = false;
+                }else {
+                    // alert: not connected
+                    Toast.makeText(context, " not_connected --> cannot close ", Toast.LENGTH_LONG).show();
+                     }
+                }
+            });
+
+        // listen for close session
+        eraseButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+
+                // close Pebble shake if a watch is connected
+                if (PebbleKit.isWatchConnected(getApplicationContext())) {
+                    // look for the signature
+                    File sigFile = new File(context.getFilesDir(), SIG_FILENAME);
+                    if (sigFile.exists()) {
+                        //Delete it
+                        boolean deleted = sigFile.delete();
+                        if (deleted) {
+
+                            // alert: erased
+                            Toast.makeText(context, " erase_existing succeeded ", Toast.LENGTH_LONG).show();
+                            // log activity
+                            Log.i(getLocalClassName(), "Erased Signature");
+
+                            // so that our next session is saved as a signature...
+                            ACTIVE_SIGNATURE = false;
+
+                        } else {
+                            Toast.makeText(context, " erase_existing failed ", Toast.LENGTH_LONG).show();
+                        }
+                    } else {
+                        // alert: no sig file exists
+                        Toast.makeText(context, " no existing sig_file ", Toast.LENGTH_LONG).show();
+                    }
+
+                } else
+
+                {
+                    // alert: not connected
+                    Toast.makeText(context, " not_connected --> cannot erase ", Toast.LENGTH_LONG).show();
+                }
+                // session index is relative to live signature
+                // *find the session_index by loading the index of the signature
+                // *if signatures !contain new_signature - add new signature, session_index=0
+                // * else session index = signature_indices[match_index]
+                session_index = 0;
+                if (current_index != 0) {
+                Log.i(getLocalClassName(),"alert: Session_index change when current_index != 0");
+            }
+        }
+    });
+
+        // define application context
+        context = getApplicationContext();
+        // define various communication handlers
+        this.setHandlers();
+    }
+
+
+    /*******************************************************\
+     *
+     * Function
+     *
+     */
+    @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        // Inflate the menu; this adds items to the action bar if it is present.
+        getMenuInflater().inflate(R.menu.menu_detector, menu);
+        return true;
+    }
+
+    /*******************************************************\
+     *
+     * Function
+     *
+     */
+    @Override
+    public boolean onOptionsItemSelected(MenuItem item) {
+        // Handle action bar item clicks here. The action bar will
+        // automatically handle clicks on the Home/Up button, so long
+        // as you specify a parent activity in AndroidManifest.xml.
+        int id = item.getItemId();
+
+        //noinspection SimplifiableIfStatement
+        if (id == R.id.action_settings) {
+            return true;
+        }
+
+        return super.onOptionsItemSelected(item);
+    }
+
+    /*******************************************************\
+     *
+     * Function called when app stops activity
+     *
+     */
+    @Override
+    protected void onStop()
+    {
+        //unregisterReceiver(this);
+        super.onStop();
+    }
+}
